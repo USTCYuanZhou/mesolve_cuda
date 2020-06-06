@@ -22,7 +22,8 @@ def load_file(file_name):
         return content.read()
 
 class send_into_cuda():
-    def __init__(self, hamiltonian, rho, tlist, c_ops, c_ops_dag, e_ops, params, tlength):
+    def __init__(self, hamiltonian, rho, tlist, c_ops, c_ops_dag, e_ops, params):
+    #prepare for cuda: inject code into template.
         self.hamiltonian    = hamiltonian
         self.rho            = rho
         self.tlist          = tlist
@@ -32,7 +33,6 @@ class send_into_cuda():
         self.params         = params
         self.expect         = []
         self.length         = tells_length(tlist)
-        self.tlength        = tlength
 
         # L_max = pycuda.tools.DeviceData().max_threads
         L_max = 256
@@ -49,7 +49,7 @@ class send_into_cuda():
         self.grid = (np.int(Gx), 1)
 
         dim = rho.shape[0]
-        print("cuda_solver: pre-compiling...\n")
+        print("cuda_solver: rendering...\n")
 
         kernel_file = load_file("mesolve_kernel.c")
         kernel = Template(kernel_file).render(**
@@ -64,7 +64,6 @@ class send_into_cuda():
             'moments': self.length,
             'thread_length': self.L,
             'ranged_param_len': len(params[1][1]),
-            'tlength': self.tlength,
 
             'dim_convert': convert_dim(self.params),
             'effect_of_Hamiltonian_k1': construct_H_code(hamiltonian, 'rho', 'k1'),
@@ -74,7 +73,7 @@ class send_into_cuda():
             'effect_of_Lindblad_k1': construct_L_code(c_ops, 'rho', 'k1'),
             'effect_of_Lindblad_k2': construct_L_code(c_ops, 'temp', 'k2'),
             'effect_of_Lindblad_k3': construct_L_code(c_ops, 'temp', 'k3'),
-            'expects': construct_expect_code(e_ops, self.tlength)
+            'expects': construct_expect_code(e_ops)
         }
         )
         # print(kernel)
@@ -83,6 +82,7 @@ class send_into_cuda():
         self.mesolve = program.get_function("mesolve")
 
     def solve(self):
+    #send matrixes into GPU and start calculation.
         f, t = drv.mem_get_info()
         print("video-memory usage: {}\n".format(1.0-f/float(t)))
         H = []
@@ -114,7 +114,7 @@ class send_into_cuda():
         
         expect = []     #steady-state result, every parameters gives one expectation at last
         for e, factor in self.e_ops:
-            expect.append(drv.InOut(np.ones(self.L*self.tlength).astype(np.complex128)))
+            expect.append(drv.InOut(np.ones(self.L).astype(np.complex128)))
 
         params = []
         for a in self.params[0][1]:
@@ -135,12 +135,13 @@ class send_into_cuda():
 
         # np.savetxt('expect.txt', expect[0].array)
         for e in expect:
-            self.expect.append(np.array(e.array.reshape(len(self.params[0][1]), len(self.params[1][1]), self.tlength)))
+            self.expect.append(np.array(e.array.reshape(len(self.params[0][1]), len(self.params[1][1]))))
             del e
 
         print('cuda_solver: {} s\n'.format(time.time()-start))
 
 def construct_args(obj, data_type, prefix):
+#construce arguments in cuda code
     args = []
     if isinstance(obj, list):
         for ind, ops in enumerate(obj):
@@ -153,6 +154,7 @@ def construct_args(obj, data_type, prefix):
     return ', '.join(args)
 
 def convert_dim(obj):
+#convert the two-dimension parameter space [a, b] into a one-dimension [a*b, 1]
     code = []
     for ind, p in enumerate(obj):
         if not isinstance(p[1], np.ndarray):
@@ -161,18 +163,22 @@ def convert_dim(obj):
     return code
 
 def construct_H_code(obj, ind1, ind2):
+#construct the code about Hamiltonian
     code = []
     for i, ops in enumerate(obj):
         code+=['apply_Hamiltonian(h_{}, {}, {}, {});'.format(i, ind1, ind2, ops[1])]
     return code
 
 def construct_L_code(obj, ind1, ind2):
+#construct the code about Lindbladian
     code = []
     for i, ops in enumerate(obj):
         code += ['apply_Lindblad(c_ops_{}, c_ops_dag_{}, {}, {}, {});'.format(i, i, ind1, ind2, ops[1])]
     return code
 
 def tells_length(tlist):
+#returns the length of time list. Since the time list could be one dimensional or two dimensional one
+#things are different in two cases
     if isinstance(tlist[0], np.ndarray):
         return len(tlist[0])
     elif isinstance(tlist, np.ndarray):
@@ -180,8 +186,9 @@ def tells_length(tlist):
     else:
         raise TypeError("Time list illegal")
 
-def construct_expect_code(obj, tlength):
+def construct_expect_code(obj):
+#contruct the code about expectation operator
     code = []
     for i, ops in enumerate(obj):
-        code += ['expect_{}[offset*{} + index] = matrix_trace(rho, e_ops_{});'.format(i, tlength, i)]
+        code += ['expect_{}[offset] = matrix_trace(rho, e_ops_{});'.format(i, i)]
     return code
